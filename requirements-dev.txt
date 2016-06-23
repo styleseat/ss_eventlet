@@ -1,0 +1,7 @@
+# Requirements, including all external networking libraries with which
+# this package can integrate.
+-r requirements-test.txt
+-e .
+httplib2
+requests
+tox
