@@ -6,6 +6,7 @@ import sys
 from contextlib import contextmanager
 
 import eventlet
+from eventlet.support import six
 
 from . import utils
 
@@ -30,8 +31,7 @@ else:
         instrument(target_module)
 
 
-_currently_patched_packages = {}
-
+_module_dependency_cache = {}
 
 @contextmanager
 def _patch_package_module(module_name, additional_modules=None):
@@ -83,53 +83,51 @@ def _patch_package_module(module_name, additional_modules=None):
     root_module = ancestors[0]
     # Initialize the saver prior to examining sys.modules in order to acquire
     # the import lock, preventing other threads from mutating sys.modules
-    # and other shared state during the patching process.
+    # during the patching process.
     saver = eventlet.patcher.SysModulesSaver()
     try:
-        # The implementation does not support nesting patches of modules in the
-        # same root package. Properly supporting such nested patches would
-        # require not resetting the entire package state in sys.modules, so
-        # that modules containing classes such as exceptions can be shared
-        # within the package.
-        if root_module in _currently_patched_packages:
-            raise RuntimeError(
-                'Cannot patch module %s in root package %s'
-                ' while module %s is already patched' % (
-                    module_name, root_module,
-                    _currently_patched_packages[root_module]))
-        _currently_patched_packages[root_module] = module_name
+        original_modules = set(sys.modules)
+        original_modules.add(module_name)
+        saver.save(*original_modules)
         try:
-            original_modules = set(sys.modules)
-            original_modules.add(module_name)
-            saver.save(*original_modules)
-            # Determine which modules (apart from the target module) the
-            # patching process will add to sys.modules, and freeze their state.
-            # Avoid freezing all of sys.modules, as eventlet caches patched
-            # modules in sys.modules.
-            importlib.import_module(module_name)
-            new_modules = set(sys.modules) - original_modules
-            utils.delete_sys_modules(new_modules)
-            saver.save(*new_modules)
-
+            dependency_cache = _module_dependency_cache[module_name]
+        except KeyError:
+            dependency_cache = None
+            # Determine which modules, if any, will be added to sys.modules while
+            # patching the target module, and freeze their state. Avoid freezing
+            # all of sys.modules, as eventlet caches patched modules in
+            # sys.modules.
             utils.delete_sys_modules(
                 list(utils.iter_descendent_module_names(root_module)))
-            # Patch the target module and all of its ancestors, rather than
-            # just the target module, because import_patched caches patched
-            # modules, so subsequent calls to this function must restore the
-            # cached module's ancestry tree to avoid creating a rootless
-            # module.
-            for name in ancestors:
-                sys.modules[name] = eventlet.import_patched(name)
-            # Due to patched module caching, patches only import a module's
-            # dependencies the first time. Make repeat calls as consistent
-            # as possible by deregistering all unpatched modules in the root
-            # package from sys.modules.
+            pre_import_modules = set(sys.modules)
+            importlib.import_module(module_name)
+            new_modules = set(sys.modules) - pre_import_modules
+            utils.delete_sys_modules(new_modules)
+            saver.save(*(new_modules - original_modules))
+            dependencies = set(
+                x for x in new_modules if
+                x.startswith(root_module) and x not in ancestors)
+        else:
+            saver.save(*dependency_cache.keys())
+
+        if dependency_cache is None:
             utils.delete_sys_modules(
-                set(utils.iter_descendent_module_names(root_module)) -
-                set(ancestors))
-            yield sys.modules[module_name]
-        finally:
-            del _currently_patched_packages[root_module]
+                list(utils.iter_descendent_module_names(root_module)))
+        else:
+            utils.delete_sys_modules(
+                list(utils.iter_descendent_module_names(module_name)))
+            for name, module in six.iteritems(dependency_cache):
+                sys.modules[name] = module
+        # Patch the target module and all of its ancestors, rather than just
+        # the target module, because import_patched caches patched modules, so
+        # subsequent calls to this function must restore the cached module's
+        # ancestry tree to avoid creating a rootless module.
+        for name in ancestors:
+            sys.modules[name] = eventlet.import_patched(name)
+        if dependency_cache is None:
+            _module_dependency_cache[module_name] = {
+                name: sys.modules[name] for name in dependencies}
+        yield sys.modules[module_name]
     finally:
         saver.restore()
 
